@@ -24,6 +24,7 @@ from models import Yolov4
 import argparse
 from easydict import EasyDict as edict
 from torch.nn import functional as F
+from tool.utils import do_detect
 
 import numpy as np
 
@@ -253,7 +254,7 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     train_loader = DataLoader(train_dataset, batch_size=config.batch // config.subdivisions, shuffle=True,
                               num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate)
 
-    val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=8,
+    val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=0,
                             pin_memory=True, drop_last=True)
 
     writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
@@ -301,6 +302,15 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
     model.train()
+
+    stats, ap = [], []
+    seen = 0
+    iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
+    niou = iouv.numel()
+
+    from .metrics import ConfusionMatrix
+    confusion_matrix = ConfusionMatrix(nc=model.cfg.classes)
+
     for epoch in range(epochs):
         #model.train()
         epoch_loss = 0
@@ -353,7 +363,51 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
                                           scheduler.get_lr()[0] * config.batch))
 
                 pbar.update(images.shape[0])
+            
 
+            for i, batch in enumerate(val_dataset):
+                image = batch[0]
+                bboxes = batch[1]
+
+                width = image.shape[1]
+                height = image.shape[0]
+                
+                target_bboxes = []
+                for bbox in bboxes:
+                    x1 = int((bbox[0] - bbox[2] / 2.0) * width)
+                    y1 = int((bbox[1] - bbox[3] / 2.0) * height)
+                    x2 = int((bbox[0] + bbox[2] / 2.0) * width)
+                    y2 = int((bbox[1] + bbox[3] / 2.0) * height)
+                    c = bbox[4]
+
+                    target_bboxes.append([c, x1, y1, x2, y2])
+        
+    
+                boxes = do_detect(model, image, 0.5, cfg.classes, 0.4, 1)  
+                predict_bboxes = []
+                for bbox in boxes:
+                    x1 = int((bbox[0] - bbox[2] / 2.0) * width)
+                    y1 = int((bbox[1] - bbox[3] / 2.0) * height)
+                    x2 = int((bbox[0] + bbox[2] / 2.0) * width)
+                    y2 = int((bbox[1] + bbox[3] / 2.0) * height)
+                    conf = bbox[4]
+                    c = bbox[5]
+
+                    predict_bboxes.append([x1, y1, x2, y2, conf, c])
+
+                predict_bboxes = torch.from_numpy(np.array(predict_bboxes))
+                target_bboxes = torch.from_numpy(np.array(target_bboxes))
+
+                from .metrics import process_batch
+                correct = process_batch(predict_bboxes, target_bboxes, iouv)    
+                confusion_matrix.process_batch(predict_bboxes, target_bboxes)
+
+                # Append statistics (correct, conf, pcls, tcls)
+                stats.append((correct.cpu(), predict_bboxes[:, 4].cpu(), predict_bboxes[:, 5].cpu(), tcls))
+            
+            confusion_matrix.plot(save_dir="./confusion_matrix.png", names=list(model.names))
+        
+                
             if save_cp:
                 try:
                     os.mkdir(config.checkpoints)
