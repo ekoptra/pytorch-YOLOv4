@@ -9,6 +9,8 @@ import numpy as np
 import torch
 import warnings
 from . import general
+import sys
+import os
 
 def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names=()):
     """ Compute the average precision, given the recall and precision curves.
@@ -63,15 +65,27 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
 
     # Compute F1 (harmonic mean of precision and recall)
     f1 = 2 * p * r / (p + r + 1e-16)
+    
+    list_plot = []
+
     if plot:
-        plot_pr_curve(px, py, ap, Path(save_dir) / 'PR_curve.png', names)
-        plot_mc_curve(px, f1, Path(save_dir) / 'F1_curve.png', names, ylabel='F1')
-        plot_mc_curve(px, p, Path(save_dir) / 'P_curve.png', names, ylabel='Precision')
-        plot_mc_curve(px, r, Path(save_dir) / 'R_curve.png', names, ylabel='Recall')
+        path_plot_pr = os.path.join(save_dir, 'PR_curve.png')
+        plot_pr_curve(px, py, ap, path_plot_pr , names)
+
+        path_plot_f1 = os.path.join(save_dir, 'F1_curve.png')
+        plot_mc_curve(px, f1, path_plot_f1, names, ylabel='F1')
+
+        path_plot_p = os.path.join(save_dir, 'P_curve.png')
+        plot_mc_curve(px, path_plot_p, ylabel='Precision')
+
+        path_plot_r = os.path.join(save_dir, 'R_curve.png')
+        plot_mc_curve(px, r, path_plot_r, names, ylabel='Recall')
+
+        list_plot = [path_plot_pr, path_plot_f1, path_plot_p, path_plot_r]
 
     # i = f1.mean(0).argmax()  # max F1 index
     # return p[:, i], r[:, i], ap, f1[:, i], unique_classes.astype('int32')
-    return p, r, ap, f1, unique_classes.astype('int32')
+    return p, r, ap, f1, unique_classes.astype('int32'), list_plot
 
 
 def compute_ap(recall, precision):

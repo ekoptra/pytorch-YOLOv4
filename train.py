@@ -24,7 +24,10 @@ from models import Yolov4
 import argparse
 from easydict import EasyDict as edict
 from torch.nn import functional as F
-from tool.utils import do_detect
+from tool.utils import do_detect, load_class_names
+from tool.metrics import process_batch, ap_per_class, ConfusionMatrix
+import cv2
+from pathlib import Path
 
 import numpy as np
 
@@ -244,7 +247,9 @@ def collate(batch):
     return images, bboxes
 
 
-def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5):
+
+
+def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=20, img_scale=0.5, save_dir=None):
     train_dataset = Yolo_dataset(config.train_label, config)
     val_dataset = Yolo_dataset(config.val_label, config)
 
@@ -257,7 +262,8 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     val_loader = DataLoader(val_dataset, batch_size=config.batch // config.subdivisions, shuffle=True, num_workers=0,
                             pin_memory=True, drop_last=True)
 
-    writer = SummaryWriter(log_dir=config.TRAIN_TENSORBOARD_DIR,
+
+    writer = SummaryWriter(log_dir=save_dir,
                            filename_suffix=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}',
                            comment=f'OPT_{config.TRAIN_OPTIMIZER}_LR_{config.learning_rate}_BS_{config.batch}_Sub_{config.subdivisions}_Size_{config.width}')
     # writer.add_images('legend',
@@ -267,18 +273,19 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     # global_step = cfg.TRAIN_MINEPOCH * n_train
     global_step = 0
     logging.info(f'''Starting training:
-        Epochs:          {epochs}
-        Batch size:      {config.batch}
-        Subdivisions:    {config.subdivisions}
-        Learning rate:   {config.learning_rate}
-        Training size:   {n_train}
-        Validation size: {n_val}
-        Checkpoints:     {save_cp}
-        Device:          {device.type}
-        Images size:     {config.width}
-        Optimizer:       {config.TRAIN_OPTIMIZER}
-        Dataset classes: {config.classes}
-        Train label path:{config.train_label}
+        Epochs:                {epochs}
+        Batch size:            {config.batch}
+        Subdivisions:          {config.subdivisions}
+        Learning rate:         {config.learning_rate}
+        Training size:         {n_train}
+        Validation size:       {n_val}
+        Checkpoints:           {save_cp}
+        Device:                {device.type}
+        Images size:           {config.width}
+        Optimizer:             {config.TRAIN_OPTIMIZER}
+        Dataset classes:       {config.classes}
+        Train label path:      {config.train_label}
+        Train Class Name Path: {config.class_names}
         Pretrained:
     ''')
 
@@ -302,14 +309,6 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
     # scheduler = CosineAnnealingWarmRestarts(optimizer, 0.001, 1e-6, 20)
 
     model.train()
-
-    stats, ap = [], []
-    seen = 0
-    iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
-    niou = iouv.numel()
-
-    from .metrics import ConfusionMatrix
-    confusion_matrix = ConfusionMatrix(nc=model.cfg.classes)
 
     for epoch in range(epochs):
         #model.train()
@@ -364,61 +363,124 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
                 pbar.update(images.shape[0])
             
+            if (epoch == len(epochs) - 1) or ((epoch + 1) % config.eval_interval == 0):
+                evaluate(model, config val_dataset, writer, epoch, save_dir)
 
-            for i, batch in enumerate(val_dataset):
-                image = batch[0]
-                bboxes = batch[1]
-
-                width = image.shape[1]
-                height = image.shape[0]
-                
-                target_bboxes = []
-                for bbox in bboxes:
-                    x1 = int((bbox[0] - bbox[2] / 2.0) * width)
-                    y1 = int((bbox[1] - bbox[3] / 2.0) * height)
-                    x2 = int((bbox[0] + bbox[2] / 2.0) * width)
-                    y2 = int((bbox[1] + bbox[3] / 2.0) * height)
-                    c = bbox[4]
-
-                    target_bboxes.append([c, x1, y1, x2, y2])
-        
-    
-                boxes = do_detect(model, image, 0.5, cfg.classes, 0.4, 1)  
-                predict_bboxes = []
-                for bbox in boxes:
-                    x1 = int((bbox[0] - bbox[2] / 2.0) * width)
-                    y1 = int((bbox[1] - bbox[3] / 2.0) * height)
-                    x2 = int((bbox[0] + bbox[2] / 2.0) * width)
-                    y2 = int((bbox[1] + bbox[3] / 2.0) * height)
-                    conf = bbox[4]
-                    c = bbox[5]
-
-                    predict_bboxes.append([x1, y1, x2, y2, conf, c])
-
-                predict_bboxes = torch.from_numpy(np.array(predict_bboxes))
-                target_bboxes = torch.from_numpy(np.array(target_bboxes))
-
-                from .metrics import process_batch
-                correct = process_batch(predict_bboxes, target_bboxes, iouv)    
-                confusion_matrix.process_batch(predict_bboxes, target_bboxes)
-
-                # Append statistics (correct, conf, pcls, tcls)
-                stats.append((correct.cpu(), predict_bboxes[:, 4].cpu(), predict_bboxes[:, 5].cpu(), tcls))
-            
-            confusion_matrix.plot(save_dir="./confusion_matrix.png", names=list(model.names))
-        
-                
             if save_cp:
                 try:
-                    os.mkdir(config.checkpoints)
+                    checkpoint_dir = os.mkdir(os.path.join(save_dir, config.checkpoints))
                     logging.info('Created checkpoint directory')
                 except OSError:
                     pass
-                torch.save(model.state_dict(), os.path.join(config.checkpoints, f'Yolov4_epoch{epoch + 1}.pth'))
+                torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'Yolov4_epoch{epoch + 1}.pth'))
                 logging.info(f'Checkpoint {epoch + 1} saved !')
 
     writer.close()
 
+def evaluate(model, config, val_dataset, writer, epoch, save_dir):
+    stats, ap = [], []
+    seen = 0
+    iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
+    niou = iouv.numel()
+
+    class_names = load_class_names(config.class_names)
+
+    confusion_matrix = ConfusionMatrix(nc=model.cfg.classes)
+
+    logging.info("\nStart to evaluate on eval dataset ...")
+
+    for i, batch in enumerate(val_dataset):
+        longging.info(f"Predict image {i}/{len(val_dataset)}")
+
+        image = batch[0]
+        bboxes = batch[1]
+
+        width = image.shape[1]
+        height = image.shape[0]
+        
+        target_bboxes = []
+        for bbox in bboxes:
+            x1 = int((bbox[0] - bbox[2] / 2.0) * width)
+            y1 = int((bbox[1] - bbox[3] / 2.0) * height)
+            x2 = int((bbox[0] + bbox[2] / 2.0) * width)
+            y2 = int((bbox[1] + bbox[3] / 2.0) * height)
+            c = bbox[4]
+
+            target_bboxes.append([c, x1, y1, x2, y2])
+
+
+        boxes = do_detect(model, image, 0.5, cfg.classes, 0.4, 1)  
+        predict_bboxes = []
+        for bbox in boxes:
+            x1 = int((bbox[0] - bbox[2] / 2.0) * width)
+            y1 = int((bbox[1] - bbox[3] / 2.0) * height)
+            x2 = int((bbox[0] + bbox[2] / 2.0) * width)
+            y2 = int((bbox[1] + bbox[3] / 2.0) * height)
+            conf = bbox[4]
+            c = bbox[5]
+
+            predict_bboxes.append([x1, y1, x2, y2, conf, c])
+
+        predict_bboxes = torch.from_numpy(np.array(predict_bboxes))
+        target_bboxes = torch.from_numpy(np.array(target_bboxes))
+
+        
+        correct = process_batch(predict_bboxes, target_bboxes, iouv)    
+        confusion_matrix.process_batch(predict_bboxes, target_bboxes)
+
+        # Append statistics (correct, conf, pcls, tcls)
+        stats.append((correct.cpu(), predict_bboxes[:, 4].cpu(), predict_bboxes[:, 5].cpu(), target_bboxes[:, 4].cpu()))
+    
+    stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
+
+    if len(stats) and stats[0].any():
+
+        p, r, ap, f1, ap_class, list_plot = ap_per_class(*stats, plot=True, save_dir=save_dir, names=class_names)
+
+        AP50_F1_max_idx = len(f1.mean(0)) - f1.mean(0)[::-1].argmax() -1
+        longging.info(f"IOU 50 best mF1 thershold near {AP50_F1_max_idx/1000.0}.")
+        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+        mp, mr, mf1, map50, map = p[:, AP50_F1_max_idx].mean(), r[:, AP50_F1_max_idx].mean(), f1[:, AP50_F1_max_idx].mean(), ap50.mean(), ap.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=len(class_names))  # number of targets per class
+
+        # Print results
+        s = ('%-16s' + '%12s' * 7) % ('Class', 'Images', 'Labels', 'P@.5iou', 'R@.5iou', 'F1@.5iou', 'mAP@.5', 'mAP@.5:.95')
+        longging.info(s)
+        pf = '%-16s' + '%12i' * 2 + '%12.3g' * 5  # print format
+        longging.info(pf % ('all', seen, nt.sum(), mp, mr, mf1, map50, map))
+
+        pr_metric_result = (map50, map, mp, mr, mf1)
+
+        # Print results per class
+        for i, c in enumerate(ap_class):
+            longging.info(pf % (class_names[c], seen, nt[c], p[i, AP50_F1_max_idx], r[i, AP50_F1_max_idx],
+                                f1[i, AP50_F1_max_idx], ap50[i], ap[i]))
+
+    confusion_matrix_path = os.path.join(save_dir, "confusion_matrix.png")
+    confusion_matrix.plot(save_dir=confusion_matrix_path, names=class_names)
+
+    list_plot.append(confusion_matrix_path)
+
+    imgs = []
+    imgs_name = []
+    for img_path in list_plot:
+            ori_img = cv2.imread(img_path)
+
+            imgs.append(torch.from_numpy(ori_img[:, :, ::-1].copy()))
+    
+            imgs_name.append(img_path.split('/')[-1].split('.')[0])
+
+    for img, name in zip(imgs, imgs_name):
+        try:
+            writer.add_image(name, img, epoch + 1, dataformats='HWC')
+        except:
+            longging.warning(f'WARNING: failed to add {name} plot to tensorboard.\n')
+
+    writer.add_scalar("metrics/mAP@0.5", pr_metric_result[0], epoch + 1)
+    writer.add_scalar("metrics/mAP@0.50:0.95", pr_metric_result[1], epoch + 1)
+    writer.add_scalar("metrics/P@.5iou", pr_metric_result[2], epoch + 1)
+    writer.add_scalar("metrics/R@.5iou", pr_metric_result[3], epoch + 1)
+    writer.add_scalar("metrics/F1@.5iou", pr_metric_result[4], epoch + 1)
 
 def get_args(**kwargs):
     cfg = kwargs
@@ -438,6 +500,8 @@ def get_args(**kwargs):
     parser.add_argument('-classes',type=int,default=80,help='dataset classes')
     parser.add_argument('-train_label_path',dest='train_label',type=str,default='train.txt',help="train label path")
     parser.add_argument('-epochs',dest='TRAIN_EPOCHS',type=int,default=10,help="number of training epochs")
+    parser.add_argument('-c', '--class-names' , dest='class_names',type=str,default="_classes.txt", help="Path to name of the clasess")
+    parser.add_argument('-e', '--eval-interval', dest='eval_interval', default=20, type=int, help='evaluate at every interval epochs')
     args = vars(parser.parse_args())
 
     for k in args.keys():
@@ -460,8 +524,7 @@ def init_logger(log_file=None, log_dir=None, log_level=logging.INFO, mode='w', s
         log_dir = '~/temp/log/'
     if log_file is None:
         log_file = 'log_' + get_date_str() + '.txt'
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
+    
     log_file = os.path.join(log_dir, log_file)
     # 此处不能使用logging输出
     print('log file path:' + log_file)
@@ -480,9 +543,27 @@ def init_logger(log_file=None, log_dir=None, log_level=logging.INFO, mode='w', s
 
     return logging
 
+def increment_name(path):
+    '''increase save directory's id'''
+    path = Path(path)
+    sep = ''
+    if path.exists():
+        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+        for n in range(1, 9999):
+            p = f'{path}{sep}{n}{suffix}'
+            if not os.path.exists(p):
+                break
+        path = Path(p)
+    return path
+
 
 if __name__ == "__main__":
-    logging = init_logger(log_dir='log')
+    save_dir = str(increment_name(os.path.join('runs/train', 'exp')))
+
+    if not os.path.exists(save_dir):
+        os.makedirs(save_dir)
+
+    logging = init_logger(log_dir=save_dir)
     cfg = get_args(**Cfg)
     os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -495,10 +576,12 @@ if __name__ == "__main__":
     model.to(device=device)
 
     try:
+        
         train(model=model,
               config=cfg,
               epochs=cfg.TRAIN_EPOCHS,
-              device=device, )
+              device=device, 
+              save_dir=save_dir)
     except KeyboardInterrupt:
         torch.save(model.state_dict(), 'INTERRUPTED.pth')
         logging.info('Saved interrupt')
