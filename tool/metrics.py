@@ -29,7 +29,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
     # Sort by objectness
     i = np.argsort(-conf)
     tp, conf, pred_cls = tp[i], conf[i], pred_cls[i]
-
+    
     # Find unique classes
     unique_classes = np.unique(target_cls)
     nc = unique_classes.shape[0]  # number of classes, number of detections
@@ -76,7 +76,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
         plot_mc_curve(px, f1, path_plot_f1, names, ylabel='F1')
 
         path_plot_p = os.path.join(save_dir, 'P_curve.png')
-        plot_mc_curve(px, path_plot_p, ylabel='Precision')
+        plot_mc_curve(px, p, path_plot_p, ylabel='Precision')
 
         path_plot_r = os.path.join(save_dir, 'R_curve.png')
         plot_mc_curve(px, r, path_plot_r, names, ylabel='Recall')
@@ -171,7 +171,10 @@ def process_batch(detections, labels, iouv):
     for i in range(len(iouv)):
         x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
         if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
+            a = torch.stack(x, 1).type(torch.LongTensor)
+            b = (iou[x[0], x[1]][:, None]).type(torch.LongTensor)
+
+            matches = torch.cat((a, b), 1).cpu().numpy()  # [label, detect, iou]
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
@@ -205,7 +208,9 @@ class ConfusionMatrix:
 
         x = torch.where(iou > self.iou_thres)
         if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()
+            a = torch.stack(x, 1).type(torch.LongTensor)
+            b = (iou[x[0], x[1]][:, None]).type(torch.LongTensor)
+            matches = torch.cat((a, b), 1).cpu().numpy()
             if x[0].shape[0] > 1:
                 matches = matches[matches[:, 2].argsort()[::-1]]
                 matches = matches[np.unique(matches[:, 1], return_index=True)[1]]

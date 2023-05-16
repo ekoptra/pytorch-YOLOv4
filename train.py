@@ -30,7 +30,7 @@ import cv2
 from pathlib import Path
 
 import numpy as np
-
+from PIL import Image
 
 def bboxes_iou(bboxes_a, bboxes_b, xyxy=True):
     """Calculate the Intersection of Unions (IoUs) between bounding boxes.
@@ -278,7 +278,6 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
         Subdivisions:          {config.subdivisions}
         Learning rate:         {config.learning_rate}
         Training size:         {n_train}
-        Validation size:       {n_val}
         Checkpoints:           {save_cp}
         Device:                {device.type}
         Images size:           {config.width}
@@ -363,12 +362,14 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
                 pbar.update(images.shape[0])
             
-            if (epoch == len(epochs) - 1) or ((epoch + 1) % config.eval_interval == 0):
-                evaluate(model, config val_dataset, writer, epoch, save_dir)
+            # evaluate on last epochs or base on eval interval
+            if (epoch == epochs - 1) or (((epoch + 1) % config.eval_interval) == 0):
+                evaluate(model, config, writer, epoch, save_dir)
 
             if save_cp:
                 try:
-                    checkpoint_dir = os.mkdir(os.path.join(save_dir, config.checkpoints))
+                    checkpoint_dir = os.path.join(save_dir, config.checkpoints)
+                    os.mkdir(checkpoint_dir)
                     logging.info('Created checkpoint directory')
                 except OSError:
                     pass
@@ -377,7 +378,13 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
 
     writer.close()
 
-def evaluate(model, config, val_dataset, writer, epoch, save_dir):
+def evaluate(model, config, writer, epoch, save_dir):
+    eval_label = config.eval_label
+    base_path = '/'.join(eval_label.split('/')[:-1])
+
+    with open(eval_label, 'r') as f:
+        val_dataset = [line.rstrip() for line in f]
+
     stats, ap = [], []
     seen = 0
     iouv = torch.linspace(0.5, 0.95, 10)  # iou vector for mAP@0.5:0.95
@@ -385,79 +392,85 @@ def evaluate(model, config, val_dataset, writer, epoch, save_dir):
 
     class_names = load_class_names(config.class_names)
 
-    confusion_matrix = ConfusionMatrix(nc=model.cfg.classes)
+    confusion_matrix = ConfusionMatrix(nc=len(class_names))
 
     logging.info("\nStart to evaluate on eval dataset ...")
 
-    for i, batch in enumerate(val_dataset):
-        longging.info(f"Predict image {i}/{len(val_dataset)}")
+    width = 608
+    height = 608
+    for i, img_label in enumerate(val_dataset):
+        parsed = img_label.split(' ')
 
-        image = batch[0]
-        bboxes = batch[1]
+        logging.info(f"Predict image {i+1}/{len(val_dataset)}: {parsed[0]}")
+        seen += 1
 
-        width = image.shape[1]
-        height = image.shape[0]
         
+        img = Image.open(os.path.join(base_path, parsed[0])).convert('RGB')
+        img = img.resize((width, height))
+
+        bboxes = []
+        for p in parsed[1:]:
+            p = p.split(',')
+            bboxes.append([int(p[0]),int(p[1]), int(p[2]), int(p[3]), int(p[4])])
+        
+
         target_bboxes = []
+        print("len ", len(bboxes))
+        print(bboxes)
         for bbox in bboxes:
-            x1 = int((bbox[0] - bbox[2] / 2.0) * width)
-            y1 = int((bbox[1] - bbox[3] / 2.0) * height)
-            x2 = int((bbox[0] + bbox[2] / 2.0) * width)
-            y2 = int((bbox[1] + bbox[3] / 2.0) * height)
             c = bbox[4]
 
-            target_bboxes.append([c, x1, y1, x2, y2])
+            target_bboxes.append([c, bbox[0], bbox[1], bbox[2], bbox[3]])
 
 
-        boxes = do_detect(model, image, 0.5, cfg.classes, 0.4, 1)  
+        boxes = do_detect(model, img, 0.5, cfg.classes, 0.4, 1)
         predict_bboxes = []
         for bbox in boxes:
             x1 = int((bbox[0] - bbox[2] / 2.0) * width)
             y1 = int((bbox[1] - bbox[3] / 2.0) * height)
             x2 = int((bbox[0] + bbox[2] / 2.0) * width)
             y2 = int((bbox[1] + bbox[3] / 2.0) * height)
-            conf = bbox[4]
-            c = bbox[5]
+            conf = bbox[5]
+            c = bbox[6]
 
             predict_bboxes.append([x1, y1, x2, y2, conf, c])
 
-        predict_bboxes = torch.from_numpy(np.array(predict_bboxes))
-        target_bboxes = torch.from_numpy(np.array(target_bboxes))
+        predict_bboxes = torch.from_numpy(np.array(predict_bboxes, dtype=np.float64))
+        target_bboxes = torch.from_numpy(np.array(target_bboxes, dtype=np.float64))
 
-        
-        correct = process_batch(predict_bboxes, target_bboxes, iouv)    
+        correct = process_batch(predict_bboxes.cpu(), target_bboxes.cpu(), iouv)    
         confusion_matrix.process_batch(predict_bboxes, target_bboxes)
 
         # Append statistics (correct, conf, pcls, tcls)
-        stats.append((correct.cpu(), predict_bboxes[:, 4].cpu(), predict_bboxes[:, 5].cpu(), target_bboxes[:, 4].cpu()))
+        stats.append((correct.cpu(), predict_bboxes[:, 4].cpu(), predict_bboxes[:, 5].cpu(), target_bboxes[:, 0].cpu()))
     
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
 
-    if len(stats) and stats[0].any():
+    list_plot = []
 
-        p, r, ap, f1, ap_class, list_plot = ap_per_class(*stats, plot=True, save_dir=save_dir, names=class_names)
+    p, r, ap, f1, ap_class, list_plot = ap_per_class(*stats, plot=True, save_dir=save_dir, names=class_names)
 
-        AP50_F1_max_idx = len(f1.mean(0)) - f1.mean(0)[::-1].argmax() -1
-        longging.info(f"IOU 50 best mF1 thershold near {AP50_F1_max_idx/1000.0}.")
-        ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
-        mp, mr, mf1, map50, map = p[:, AP50_F1_max_idx].mean(), r[:, AP50_F1_max_idx].mean(), f1[:, AP50_F1_max_idx].mean(), ap50.mean(), ap.mean()
-        nt = np.bincount(stats[3].astype(np.int64), minlength=len(class_names))  # number of targets per class
+    AP50_F1_max_idx = len(f1.mean(0)) - f1.mean(0)[::-1].argmax() -1
+    logging.info(f"IOU 50 best mF1 thershold near {AP50_F1_max_idx/1000.0}.")
+    ap50, ap = ap[:, 0], ap.mean(1)  # AP@0.5, AP@0.5:0.95
+    mp, mr, mf1, map50, map = p[:, AP50_F1_max_idx].mean(), r[:, AP50_F1_max_idx].mean(), f1[:, AP50_F1_max_idx].mean(), ap50.mean(), ap.mean()
+    nt = np.bincount(stats[3].astype(np.int64), minlength=len(class_names))  # number of targets per class
 
-        # Print results
-        s = ('%-16s' + '%12s' * 7) % ('Class', 'Images', 'Labels', 'P@.5iou', 'R@.5iou', 'F1@.5iou', 'mAP@.5', 'mAP@.5:.95')
-        longging.info(s)
-        pf = '%-16s' + '%12i' * 2 + '%12.3g' * 5  # print format
-        longging.info(pf % ('all', seen, nt.sum(), mp, mr, mf1, map50, map))
+    # Print results
+    s = ('%-16s' + '%12s' * 7) % ('Class', 'Images', 'Labels', 'P@.5iou', 'R@.5iou', 'F1@.5iou', 'mAP@.5', 'mAP@.5:.95')
+    logging.info(s)
+    pf = '%-16s' + '%12i' * 2 + '%12.3g' * 5  # print format
+    logging.info(pf % ('all', seen, nt.sum(), mp, mr, mf1, map50, map))
 
-        pr_metric_result = (map50, map, mp, mr, mf1)
+    pr_metric_result = (map50, map, mp, mr, mf1)
 
-        # Print results per class
-        for i, c in enumerate(ap_class):
-            longging.info(pf % (class_names[c], seen, nt[c], p[i, AP50_F1_max_idx], r[i, AP50_F1_max_idx],
-                                f1[i, AP50_F1_max_idx], ap50[i], ap[i]))
+    # Print results per class
+    for i, c in enumerate(ap_class):
+        logging.info(pf % (class_names[c], seen, nt[c], p[i, AP50_F1_max_idx], r[i, AP50_F1_max_idx],
+                            f1[i, AP50_F1_max_idx], ap50[i], ap[i]))
 
     confusion_matrix_path = os.path.join(save_dir, "confusion_matrix.png")
-    confusion_matrix.plot(save_dir=confusion_matrix_path, names=class_names)
+    confusion_matrix.plot(save_dir=save_dir, names=class_names)
 
     list_plot.append(confusion_matrix_path)
 
@@ -474,13 +487,13 @@ def evaluate(model, config, val_dataset, writer, epoch, save_dir):
         try:
             writer.add_image(name, img, epoch + 1, dataformats='HWC')
         except:
-            longging.warning(f'WARNING: failed to add {name} plot to tensorboard.\n')
+            logging.warning(f'WARNING: failed to add {name} plot to tensorboard.\n')
 
-    writer.add_scalar("metrics/mAP@0.5", pr_metric_result[0], epoch + 1)
-    writer.add_scalar("metrics/mAP@0.50:0.95", pr_metric_result[1], epoch + 1)
-    writer.add_scalar("metrics/P@.5iou", pr_metric_result[2], epoch + 1)
-    writer.add_scalar("metrics/R@.5iou", pr_metric_result[3], epoch + 1)
-    writer.add_scalar("metrics/F1@.5iou", pr_metric_result[4], epoch + 1)
+    writer.add_scalar("metrics/mAP_0.5", pr_metric_result[0], epoch + 1)
+    writer.add_scalar("metrics/mAP_0.50_0.95", pr_metric_result[1], epoch + 1)
+    writer.add_scalar("metrics/P_.5iou", pr_metric_result[2], epoch + 1)
+    writer.add_scalar("metrics/R_.5iou", pr_metric_result[3], epoch + 1)
+    writer.add_scalar("metrics/F1_.5iou", pr_metric_result[4], epoch + 1)
 
 def get_args(**kwargs):
     cfg = kwargs
@@ -502,6 +515,7 @@ def get_args(**kwargs):
     parser.add_argument('-epochs',dest='TRAIN_EPOCHS',type=int,default=10,help="number of training epochs")
     parser.add_argument('-c', '--class-names' , dest='class_names',type=str,default="_classes.txt", help="Path to name of the clasess")
     parser.add_argument('-e', '--eval-interval', dest='eval_interval', default=20, type=int, help='evaluate at every interval epochs')
+    parser.add_argument('--eval-label-path', dest='eval_label', default='_annotations.txt', type=str, help='eval label path')
     args = vars(parser.parse_args())
 
     for k in args.keys():
@@ -583,7 +597,7 @@ if __name__ == "__main__":
               device=device, 
               save_dir=save_dir)
     except KeyboardInterrupt:
-        torch.save(model.state_dict(), 'INTERRUPTED.pth')
+        torch.save(model.state_dict(), os.path.join(save_dir, 'INTERRUPTED.pth'))
         logging.info('Saved interrupt')
         try:
             sys.exit(0)
