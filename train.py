@@ -366,15 +366,15 @@ def train(model, device, config, epochs=5, batch_size=1, save_cp=True, log_step=
             if (epoch == epochs - 1) or (((epoch + 1) % config.eval_interval) == 0):
                 evaluate(model, config, writer, epoch, save_dir)
 
-            if save_cp:
-                try:
-                    checkpoint_dir = os.path.join(save_dir, config.checkpoints)
-                    os.mkdir(checkpoint_dir)
-                    logging.info('Created checkpoint directory')
-                except OSError:
-                    pass
-                torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'Yolov4_epoch{epoch + 1}.pth'))
-                logging.info(f'Checkpoint {epoch + 1} saved !')
+                if save_cp:
+                    try:
+                        checkpoint_dir = os.path.join(save_dir, config.checkpoints)
+                        os.mkdir(checkpoint_dir)
+                        logging.info('Created checkpoint directory')
+                    except OSError:
+                        pass
+                    torch.save(model.state_dict(), os.path.join(checkpoint_dir, f'Yolov4_epoch{epoch + 1}.pth'))
+                    logging.info(f'Checkpoint {epoch + 1} saved !')
 
     writer.close()
 
