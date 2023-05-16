@@ -415,12 +415,8 @@ def evaluate(model, config, writer, epoch, save_dir):
         
 
         target_bboxes = []
-        print("len ", len(bboxes))
-        print(bboxes)
         for bbox in bboxes:
-            c = bbox[4]
-
-            target_bboxes.append([c, bbox[0], bbox[1], bbox[2], bbox[3]])
+            target_bboxes.append([bbox[4], bbox[0], bbox[1], bbox[2], bbox[3]])
 
 
         boxes = do_detect(model, img, 0.5, cfg.classes, 0.4, 1)
@@ -435,9 +431,15 @@ def evaluate(model, config, writer, epoch, save_dir):
 
             predict_bboxes.append([x1, y1, x2, y2, conf, c])
 
-        predict_bboxes = torch.from_numpy(np.array(predict_bboxes, dtype=np.float64))
+        
         target_bboxes = torch.from_numpy(np.array(target_bboxes, dtype=np.float64))
+        if len(predict_bboxes) == 0:
+          
+          stats.append((torch.zeros(0, niou, dtype=torch.bool), torch.Tensor(), torch.Tensor(), target_bboxes[:, 0].cpu()))
+          continue
 
+        predict_bboxes = torch.from_numpy(np.array(predict_bboxes, dtype=np.float64))
+        
         correct = process_batch(predict_bboxes.cpu(), target_bboxes.cpu(), iouv)    
         confusion_matrix.process_batch(predict_bboxes, target_bboxes)
 
