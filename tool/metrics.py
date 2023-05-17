@@ -43,7 +43,7 @@ def ap_per_class(tp, conf, pred_cls, target_cls, plot=False, save_dir='.', names
         n_p = i.sum()  # number of predictions
 
         if n_p == 0 or n_l == 0:
-             for j in range(tp.shape[1]):
+            for j in range(tp.shape[1]):
                 ap[ci, j], mpre, mrec = compute_ap([0], [0])
                 if plot and j == 0:
                     py.append(np.interp(px, mrec, mpre))  # precision at mAP@0.5
